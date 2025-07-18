@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>制御されたHTTPストレステストツール（プロキシ対応）</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        label {
+            display: block;
+            margin: 10px 0 5px;
+            font-weight: bold;
+        }
+        input, select, button, textarea {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        textarea {
+            height: 100px;
+            resize: vertical;
+        }
+        button {
+            background-color: #28a745;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+        #log {
+            margin-top: 20px;
+            background-color: #1e1e1e;
+            color: #ffffff;
+            font-family: 'Courier New', Courier, monospace;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+            border-radius: 4px;
+            white-space: pre-wrap;
+        }
+        .log-success {
+            color: #00ff00;
+        }
+        .log-error {
+            color: #ff5555;
+        }
+    </style>
+</head>
+<body>
+    <h1>制御されたHTTPストレステストツール（プロキシ対応）</h1>
+    <div class="container">
+        <label for="url">対象URLまたはIP</label>
+        <input type="text" id="url" placeholder="例: http://example.com または 192.168.1.1" required>
+
+        <label for="port">ポート（任意）</label>
+        <input type="number" id="port" placeholder="自動検出の場合は空欄（例: HTTPは80）">
+
+        <label for="duration">テスト時間（秒）</label>
+        <input type="number" id="duration" placeholder="例: 10" min="1" required>
+
+        <label for="method">リクエストメソッド</label>
+        <select id="method" required>
+            <option value="GET">HTTP GET</option>
+            <option value="POST">HTTP POST</option>
+        </select>
+
+        <label for="proxy">プロキシ設定（任意、複数可、1行に1プロキシ：サーバー:ポート:ユーザー名:パスワード）</label>
+        <textarea id="proxy" placeholder="例: 123.456.789.012:8080:username:password&#10;234.567.890.123:3128::"></textarea>
+        <p class="info">プロキシを使用する場合、ブラウザまたはOSのネットワーク設定でプロキシを有効にしてください。例: <a href="https://iproyal.com/free-proxy-list/" target="_blank">IPRoyalのフリープロキシリスト</a>から取得したプロキシを設定してください。ユーザー名/パスワードが空の場合、認証なしとみなされます。</p>
+
+        <button id="startBtn">攻撃開始</button>
+        <div id="status"></div>
+        <div id="log"></div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const urlInput = document.getElementById('url');
+        const portInput = document.getElementById('port');
+        const durationInput = document.getElementById('duration');
+        const methodSelect = document.getElementById('method');
+        const proxyInput = document.getElementById('proxy');
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+
+        let isTesting = false;
+
+        function setStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = type;
+        }
+
+        function appendLog(message, type) {
+            const timestamp = new Date().toLocaleTimeString('ja-JP');
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            logEntry.className = type;
+            logDiv.appendChild(logEntry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function parseProxies(proxyText) {
+            const proxies = [];
+            const lines = proxyText.trim().split('\n');
+            for (const line of lines) {
+                const [server, port, username, password] = line.split(':');
+                if (server && port) {
+                    proxies.push({
+                        server,
+                        port,
+                        username: username || 'なし',
+                        password: password || 'なし'
+                    });
+                }
+            }
+            return proxies;
+        }
+
+        async function sendRequest(url, method, proxy = null) {
+            try {
+                const proxyInfo = proxy ? `${proxy.server}:${proxy.port} (ユーザー: ${proxy.username}, パスワード: ${proxy.password})` : 'プロキシなし';
+                const response = await fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: method === 'POST' ? JSON.stringify({ test: 'data' }) : null,
+                    mode: 'no-cors'
+                });
+                appendLog(`Request sent: ${method} ${url} via ${proxyInfo} - Success`, 'log-success');
+                return { success: true };
+            } catch (error) {
+                appendLog(`Request sent: ${method} ${url} via ${proxyInfo} - Failed (${error.message})`, 'log-error');
+                return { success: false, error: error.message };
+            }
+        }
+
+        async function runTest(url, duration, method, proxies) {
+            const endTime = Date.now() + duration * 1000;
+            let requestCount = 0;
+            let successCount = 0;
+            let errorCount = 0;
+
+            setStatus('攻撃実行中...', 'info');
+            logDiv.innerHTML = '';
+
+            while (Date.now() < endTime && isTesting) {
+                // プロキシをランダムに選択（プロキシが入力されている場合）
+                const proxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
+
+                const result = await sendRequest(url, method, proxy);
+                requestCount++;
+                if (result.success) {
+                    successCount++;
+                } else {
+                    errorCount++;
+                }
+
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            if (isTesting) {
+                setStatus(`攻撃完了。送信リクエスト数: ${requestCount}、成功: ${successCount}、失敗: ${errorCount}`, 'success');
+            } else {
+                setStatus('攻撃が停止されました。', 'info');
+            }
+            startBtn.textContent = '攻撃開始';
+            startBtn.disabled = false;
+            isTesting = false;
+        }
+
+        startBtn.addEventListener('click', () => {
+            if (isTesting) {
+                isTesting = false;
+                startBtn.textContent = '攻撃開始';
+                startBtn.disabled = false;
+                setStatus('攻撃が停止されました。', 'info');
+                return;
+            }
+
+            const url = urlInput.value.trim();
+            const port = portInput.value.trim();
+            const duration = parseInt(durationInput.value);
+            const method = methodSelect.value;
+            const proxyText = proxyInput.value;
+
+            if (!url || !duration) {
+                setStatus('すべての必須フィールドを入力してください。', 'error');
+                return;
+            }
+
+            if (duration < 1) {
+                setStatus('攻撃時間は1秒以上で指定してください。', 'error');
+                return;
+            }
+
+            let targetUrl = url;
+            if (port) {
+                try {
+                    const urlObj = new URL(url.startsWith('http') ? url : `http://${url}`);
+                    urlObj.port = port;
+                    targetUrl = urlObj.toString();
+                } catch (e) {
+                    setStatus('URLまたはIPの形式が無効です。', 'error');
+                    return;
+                }
+            } else {
+                try {
+                    const urlObj = new URL(url.startsWith('http') ? url : `http://${url}`);
+                    targetUrl = urlObj.toString();
+                } catch (e) {
+                    setStatus('URLまたはIPの形式が無効です。', 'error');
+                    return;
+                }
+            }
+
+            const proxies = parseProxies(proxyText);
+            if (proxies.length > 0) {
+                appendLog('プロキシ設定をブラウザまたはOSで有効にしてください。', 'info');
+            }
+
+            isTesting = true;
+            startBtn.textContent = '攻撃停止';
+            startBtn.disabled = false;
+            runTest(targetUrl, duration, method, proxies);
+        });
+    </script>
+</body>
+</html>
